@@ -1,5 +1,7 @@
+import sys
 import pandas as pd
 from tabular_code_critic import analyze_and_optimize
+from tabular_code_critic.cli import main
 
 
 def test_missing_column_detection():
@@ -26,10 +28,40 @@ for _, row in df.iterrows():
     report, suggestions = analyze_and_optimize(df, code)
     assert "age" in report.used_columns
     assert "salary" in report.used_columns
-
-    # We expect a filter_sum suggestion
     assert "filter_sum" in suggestions
     suggested = suggestions["filter_sum"]
-    # Quick smoke check: it should assign to `total` and contain df["age"] > 30
     assert "total =" in suggested
     assert 'df["age"] > 30' in suggested
+
+
+def test_cli_outputs_suggestion(tmp_path, capsys):
+    csv_path = tmp_path / "sample_data.csv"
+    code_path = tmp_path / "sample_code.py"
+
+    csv_path.write_text("age,salary\n20,1000\n35,2000\n40,3000\n", encoding="utf-8")
+    code_path.write_text(
+        """total = 0
+for _, row in df.iterrows():
+    if row["age"] > 30:
+        total += row["salary"]
+""",
+        encoding="utf-8",
+    )
+
+    old_argv = sys.argv
+    try:
+        sys.argv = ["prog", str(csv_path), str(code_path)]
+        main()
+    finally:
+        sys.argv = old_argv
+
+    captured = capsys.readouterr()
+    out = captured.out
+
+    assert "=== Used columns ===" in out
+    assert "age" in out
+    assert "salary" in out
+    assert "=== Loop issues ===" in out
+    assert "df.iterrows()" in out
+    assert "=== Suggestions ===" in out
+    assert 'total = df.loc[df["age"] > 30, "salary"].sum()' in out
