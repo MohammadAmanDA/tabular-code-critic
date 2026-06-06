@@ -80,3 +80,16 @@ result = sum(values) / len(values)
     assert "filter_mean" in suggestions
     suggested = suggestions["filter_mean"]
     assert 'result = df.loc[df["age"] > 30, "salary"].mean()' == suggested
+
+def test_filter_count_suggestion():
+    df = pd.DataFrame({"age": [20, 35, 40], "salary": [1000, 2000, 3000]})
+    code = """
+count = 0
+for _, row in df.iterrows():
+    if row["age"] > 30:
+        count += 1
+"""
+    report, suggestions = analyze_and_optimize(df, code)
+    assert "filter_count" in suggestions
+    suggested = suggestions["filter_count"]
+    assert 'count = (df["age"] > 30).sum()' == suggested

@@ -1,5 +1,9 @@
 from .analyzer import TabularCodeAnalyzer, AnalysisReport
-from .rewrites import suggest_vectorized_sum, suggest_vectorized_mean
+from .rewrites import (
+    suggest_vectorized_sum,
+    suggest_vectorized_mean,
+    suggest_vectorized_count,
+)
 
 
 def analyze_and_optimize(df, code_str: str):
@@ -15,5 +19,9 @@ def analyze_and_optimize(df, code_str: str):
     mean_suggestion = suggest_vectorized_mean(code_str)
     if mean_suggestion is not None:
         suggestions["filter_mean"] = mean_suggestion
+
+    count_suggestion = suggest_vectorized_count(code_str)
+    if count_suggestion is not None:
+        suggestions["filter_count"] = count_suggestion
 
     return report, suggestions
