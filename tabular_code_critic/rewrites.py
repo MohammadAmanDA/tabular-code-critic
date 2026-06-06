@@ -2,85 +2,177 @@ import ast
 from typing import Optional, Tuple
 
 
-class FilterSumRewriter(ast.NodeTransformer):
+class FilterAggregatePatternFinder(ast.NodeVisitor):
     """
-    Look for pattern:
-        total = 0
-        for ..., row in df.iterrows():
-            if <condition using row["col"]>:
-                total += row["target_col"]
+    Finds simple loop-based tabular aggregation patterns and stores suggestions.
 
-    and suggest a vectorized alternative.
+    Supported MVP patterns:
+    1. filter + sum
+    2. filter + mean using list append + sum(list) / len(list)
     """
 
     def __init__(self):
-        super().__init__()
-        self.candidate = None  # store info needed for rewrite
+        self.sum_candidate = None
+        self.mean_candidate = None
 
     def visit_Module(self, node: ast.Module) -> ast.AST:
-        # Walk once to find pattern; for MVP, we don't actually rewrite AST,
-        # we just extract a suggested expression as string.
+        self._find_sum_pattern(node)
+        self._find_mean_pattern(node)
         self.generic_visit(node)
         return node
 
-    def visit_For(self, node: ast.For) -> ast.AST:
+    def _find_sum_pattern(self, node: ast.Module) -> None:
+        for stmt in node.body:
+            if not isinstance(stmt, ast.For):
+                continue
+
+            if not (isinstance(stmt.iter, ast.Call) and isinstance(stmt.iter.func, ast.Attribute)):
+                continue
+
+            if not (isinstance(stmt.iter.func.value, ast.Name) and stmt.iter.func.value.id == "df"):
+                continue
+
+            if stmt.iter.func.attr != "iterrows":
+                continue
+
+            if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.If):
+                continue
+
+            if_node = stmt.body[0]
+
+            if len(if_node.body) != 1 or not isinstance(if_node.body[0], ast.AugAssign):
+                continue
+
+            aug = if_node.body[0]
+
+            if not isinstance(aug.op, ast.Add):
+                continue
+
+            if not isinstance(aug.target, ast.Name):
+                continue
+
+            acc_name = aug.target.id
+
+            if not isinstance(aug.value, ast.Subscript):
+                continue
+
+            if not (isinstance(aug.value.value, ast.Name) and aug.value.value.id in ("row", "r")):
+                continue
+
+            target_col = _extract_str_key(aug.value)
+            if target_col is None:
+                continue
+
+            cond_expr, cond_col = _extract_simple_condition(if_node.test)
+            if cond_expr is None or cond_col is None:
+                continue
+
+            self.sum_candidate = {
+                "acc_name": acc_name,
+                "target_col": target_col,
+                "cond_expr": cond_expr,
+                "cond_col": cond_col,
+            }
+            return
+
+    def _find_mean_pattern(self, node: ast.Module) -> None:
         """
-        Detect the loop + accumulation pattern.
-        Very simplified pattern matcher for MVP.
+        Pattern:
+            values = []
+            for _, row in df.iterrows():
+                if row["age"] > 30:
+                    values.append(row["salary"])
+            result = sum(values) / len(values)
         """
-        # for _, row in df.iterrows():
-        if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Attribute)):
-            return node
+        body = node.body
 
-        if not (isinstance(node.iter.func.value, ast.Name) and node.iter.func.value.id == "df"):
-            return node
+        for i in range(len(body) - 2):
+            assign_list = body[i]
+            for_stmt = body[i + 1]
+            assign_mean = body[i + 2]
 
-        if node.iter.func.attr != "iterrows":
-            return node
+            # values = []
+            if not isinstance(assign_list, ast.Assign):
+                continue
+            if len(assign_list.targets) != 1 or not isinstance(assign_list.targets[0], ast.Name):
+                continue
+            list_name = assign_list.targets[0].id
 
-        # Expect body: if condition: total += row["target"]
-        if len(node.body) != 1 or not isinstance(node.body[0], ast.If):
-            return node
+            if not isinstance(assign_list.value, ast.List):
+                continue
+            if len(assign_list.value.elts) != 0:
+                continue
 
-        if_node = node.body[0]
-        cond = if_node.test
-        # expect target assignment inside if: total += row["target"]
-        if len(if_node.body) != 1 or not isinstance(if_node.body[0], ast.AugAssign):
-            return node
+            # for _, row in df.iterrows():
+            if not isinstance(for_stmt, ast.For):
+                continue
+            if not (isinstance(for_stmt.iter, ast.Call) and isinstance(for_stmt.iter.func, ast.Attribute)):
+                continue
+            if not (isinstance(for_stmt.iter.func.value, ast.Name) and for_stmt.iter.func.value.id == "df"):
+                continue
+            if for_stmt.iter.func.attr != "iterrows":
+                continue
 
-        aug = if_node.body[0]
-        if not isinstance(aug.op, ast.Add):
-            return node
+            # body should be: if cond: values.append(row["col"])
+            if len(for_stmt.body) != 1 or not isinstance(for_stmt.body[0], ast.If):
+                continue
+            if_node = for_stmt.body[0]
 
-        # Extract accumulator variable name
-        if not isinstance(aug.target, ast.Name):
-            return node
-        acc_name = aug.target.id
+            if len(if_node.body) != 1 or not isinstance(if_node.body[0], ast.Expr):
+                continue
 
-        # Extract row["target_col"]
-        if not isinstance(aug.value, ast.Subscript):
-            return node
-        if not (isinstance(aug.value.value, ast.Name) and aug.value.value.id in ("row", "r")):
-            return node
+            expr = if_node.body[0].value
+            if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)):
+                continue
 
-        target_col = _extract_str_key(aug.value)
-        if target_col is None:
-            return node
+            # values.append(...)
+            if not (isinstance(expr.func.value, ast.Name) and expr.func.value.id == list_name):
+                continue
+            if expr.func.attr != "append":
+                continue
+            if len(expr.args) != 1:
+                continue
 
-        # Condition should be something using row["cond_col"]
-        cond_expr, cond_col = _extract_simple_condition(cond)
-        if cond_expr is None or cond_col is None:
-            return node
+            append_arg = expr.args[0]
+            if not isinstance(append_arg, ast.Subscript):
+                continue
+            if not (isinstance(append_arg.value, ast.Name) and append_arg.value.id in ("row", "r")):
+                continue
 
-        # Store candidate info
-        self.candidate = {
-            "acc_name": acc_name,
-            "target_col": target_col,
-            "cond_expr": cond_expr,
-            "cond_col": cond_col,
-        }
+            target_col = _extract_str_key(append_arg)
+            if target_col is None:
+                continue
 
-        return node
+            cond_expr, cond_col = _extract_simple_condition(if_node.test)
+            if cond_expr is None or cond_col is None:
+                continue
+
+            # result = sum(values) / len(values)
+            if not isinstance(assign_mean, ast.Assign):
+                continue
+            if len(assign_mean.targets) != 1 or not isinstance(assign_mean.targets[0], ast.Name):
+                continue
+            result_name = assign_mean.targets[0].id
+
+            if not isinstance(assign_mean.value, ast.BinOp):
+                continue
+            if not isinstance(assign_mean.value.op, ast.Div):
+                continue
+
+            left = assign_mean.value.left
+            right = assign_mean.value.right
+
+            if not (_is_sum_of_name(left, list_name) and _is_len_of_name(right, list_name)):
+                continue
+
+            self.mean_candidate = {
+                "result_name": result_name,
+                "list_name": list_name,
+                "target_col": target_col,
+                "cond_expr": cond_expr,
+                "cond_col": cond_col,
+            }
+            return
 
 
 def _extract_str_key(node: ast.Subscript) -> Optional[str]:
@@ -94,7 +186,7 @@ def _extract_str_key(node: ast.Subscript) -> Optional[str]:
 
 def _extract_simple_condition(node: ast.AST) -> Tuple[Optional[str], Optional[str]]:
     """
-    For MVP, handle conditions like: row["age"] > 30, row["age"] == 25.
+    Handle conditions like: row["age"] > 30, row["age"] == 25.
     Return (condition_string, column_name).
     """
     if not isinstance(node, ast.Compare):
@@ -106,7 +198,6 @@ def _extract_simple_condition(node: ast.AST) -> Tuple[Optional[str], Optional[st
     op = node.ops[0]
     right = node.comparators[0]
 
-    # left should be row["col"]
     if not isinstance(left, ast.Subscript):
         return None, None
     if not (isinstance(left.value, ast.Name) and left.value.id in ("row", "r")):
@@ -116,22 +207,24 @@ def _extract_simple_condition(node: ast.AST) -> Tuple[Optional[str], Optional[st
     if col is None:
         return None, None
 
-    # reconstruct a simple string representation
-    op_str = type(op).__name__  # e.g., Gt, Eq
-    # we'll map common ops only
     op_map = {
-        "Gt": ">",
-        "Lt": "<",
-        "GtE": ">=",
-        "LtE": "<=",
-        "Eq": "==",
-        "NotEq": "!=",
+        ast.Gt: ">",
+        ast.Lt: "<",
+        ast.GtE: ">=",
+        ast.LtE: "<=",
+        ast.Eq: "==",
+        ast.NotEq: "!=",
     }
-    op_symbol = op_map.get(op_str)
+
+    op_symbol = None
+    for op_type, symbol in op_map.items():
+        if isinstance(op, op_type):
+            op_symbol = symbol
+            break
+
     if op_symbol is None:
         return None, None
 
-    # For MVP, require right side to be a Constant
     if not isinstance(right, ast.Constant):
         return None, None
 
@@ -140,23 +233,47 @@ def _extract_simple_condition(node: ast.AST) -> Tuple[Optional[str], Optional[st
     return cond_expr, col
 
 
+def _is_sum_of_name(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sum"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == name
+    )
+
+
+def _is_len_of_name(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "len"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == name
+    )
+
+
 def suggest_vectorized_sum(code_str: str) -> Optional[str]:
-    """
-    If a filter+sum candidate is found, return a suggested vectorized expression as string.
-    Otherwise return None.
-    """
     tree = ast.parse(code_str)
-    rewriter = FilterSumRewriter()
-    rewriter.visit(tree)
-    c = rewriter.candidate
+    finder = FilterAggregatePatternFinder()
+    finder.visit(tree)
+
+    c = finder.sum_candidate
     if c is None:
         return None
 
-    # Accumulator is a scalar; we suggest:
-    # acc_name = df.loc[cond_expr, target_col].sum()
-    cond_expr = c["cond_expr"]  # already a string like: df["age"] > 30
-    target_col = c["target_col"]
-    acc_name = c["acc_name"]
+    return f'{c["acc_name"]} = df.loc[{c["cond_expr"]}, "{c["target_col"]}"].sum()'
 
-    suggestion = f'{acc_name} = df.loc[{cond_expr}, "{target_col}"].sum()'
-    return suggestion
+
+def suggest_vectorized_mean(code_str: str) -> Optional[str]:
+    tree = ast.parse(code_str)
+    finder = FilterAggregatePatternFinder()
+    finder.visit(tree)
+
+    c = finder.mean_candidate
+    if c is None:
+        return None
+
+    return f'{c["result_name"]} = df.loc[{c["cond_expr"]}, "{c["target_col"]}"].mean()'

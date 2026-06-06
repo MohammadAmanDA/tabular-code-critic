@@ -65,3 +65,18 @@ for _, row in df.iterrows():
     assert "df.iterrows()" in out
     assert "=== Suggestions ===" in out
     assert 'total = df.loc[df["age"] > 30, "salary"].sum()' in out
+
+
+def test_filter_mean_suggestion():
+    df = pd.DataFrame({"age": [20, 35, 40], "salary": [1000, 2000, 3000]})
+    code = """
+values = []
+for _, row in df.iterrows():
+    if row["age"] > 30:
+        values.append(row["salary"])
+result = sum(values) / len(values)
+"""
+    report, suggestions = analyze_and_optimize(df, code)
+    assert "filter_mean" in suggestions
+    suggested = suggestions["filter_mean"]
+    assert 'result = df.loc[df["age"] > 30, "salary"].mean()' == suggested
